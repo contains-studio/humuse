@@ -1,0 +1,10 @@
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/*.egg-info/
+**/build/
+**/.gradle/
+**/local.properties
+.muse-state/
+pairing.png
