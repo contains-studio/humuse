@@ -42,7 +42,8 @@ Muse's
 fetches VM credentials, connects through an authenticated WebSocket, negotiates
 Noise XX, and multiplexes virtual HTTP requests inside encrypted envelopes. Device
 registration stays in the `homehub` family: upstream explicitly warns that `link`
-devices receive ESP32 OTA pushes. This implementation advertises no shell, file,
+devices receive ESP32 OTA pushes. This implementation advertises a fixed set of Pin status, speaker and camera
+commands plus location/weather context. It advertises no shell, arbitrary file,
 or OTA commands.
 
 The Linux SDK's `send_chat` returns a submission acknowledgment, not a spoken reply.
@@ -63,10 +64,11 @@ their acceptance by a live Muse VM remains to be verified. Translation is a Muse
 instruction using the configured language pair, rather than OpenPin.Center's
 separate speech/translation services.
 
-The initial adapter caps each attachment at 8 MiB. OpenPin uses CameraX's highest
+The Muse transport caps each attachment at 8 MiB; the gallery accepts originals
+up to 128 MiB and converts oversized media for forwarding. OpenPin uses CameraX's highest
 available video quality for its 15-second clips; a physical capture is needed to
-measure typical sizes. Oversized captures receive an explicit error rather than
-being silently truncated or transcoded.
+measure typical sizes. Originals are retained privately and only the Muse copy is transcoded. Failed
+conversions remain available in the gallery with a retry action.
 
 ## Verification boundary
 
@@ -76,3 +78,21 @@ verification uses generated audio, HTTP clients, and a simulated Muse server tha
 performs the real Noise handshake and encrypted request/response framing.
 Live BLE, account authorization, network/TLS reachability and Pin gestures remain
 the final acceptance tests.
+
+## Completed software extensions
+
+- Multi-message responses follow the SDK voice client's three-second settle
+  period and wait for known unfinished messages. MP3 segments are decoded and
+  encoded into one recording so per-file duration headers do not stop playback.
+- Location follows Google's [Wi-Fi geolocation contract](https://developers.google.com/maps/documentation/geolocation/requests-geolocation),
+  with IP fallback disabled. Weather uses [Open-Meteo's current-weather contract](https://open-meteo.com/en/docs).
+  The source of configured versus Pin location is preserved.
+- Local gallery persistence and private browser sessions are companion features;
+  they do not use OpenPin.Center's Firebase account system.
+- Remote controls use the Muse SDK's existing `link.invoke`/`link.result` protocol
+  and a new authenticated Pin poll/ack API. The Android app journals command IDs,
+  serializes camera actions with gestures, and polls only while awake.
+
+These extensions are locally testable. Physical sensor behavior, power transitions,
+BLE pairing, live Muse service compatibility and TLS remain hardware/account
+acceptance checks.

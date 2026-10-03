@@ -3,7 +3,9 @@
 ## Muse backend
 
 The [Muse integration](muse/README.md) adds a Linux companion backend for voice,
-vision and translation through Muse, compatible with the existing OpenPin client.
+vision and translation through Muse, weather and location, a private capture gallery,
+and remote Pin controls. Install this fork's updated Android client for remote
+status, ring, volume, photo and video commands; existing clients retain their gestures.
 See the [research and hardware limitations](muse/RESEARCH.md) before setup.
 
 OpenPin is an open-source project which lets you use your Ai Pin after Humane bricked them. You can install it in a few clicks & without any ADB certs!

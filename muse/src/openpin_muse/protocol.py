@@ -29,6 +29,8 @@ class VoiceMetadata:
     audio_size: int
     image_size: int
     device_id: str = field(repr=False)
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 @dataclass(frozen=True)
@@ -91,7 +93,10 @@ def parse_voice_header(header: bytes) -> VoiceMetadata:
             continue
         if type(number) not in (int, float) or not minimum <= number <= maximum or not math.isfinite(number):
             raise ProtocolError("Invalid numeric metadata")
-    return VoiceMetadata(value["audioSize"], value["imageSize"], device_id)
+    latitude, longitude = value.get("latitude"), value.get("longitude")
+    if (latitude is None) != (longitude is None):
+        raise ProtocolError("Location requires latitude and longitude")
+    return VoiceMetadata(value["audioSize"], value["imageSize"], device_id, latitude, longitude)
 
 
 def validate_capture(data: bytes, mime_type: str) -> None:

@@ -72,6 +72,14 @@ class CameraManager
         val config = captureConfig ?: cameraConfig.defaultImageCaptureConfig
         val imageCapture = buildImageCapture(config)
         val preview = buildPreview()
+        cont.invokeOnCancellation {
+            mainHandler.post {
+                // A late callback may belong to a capture that has been replaced.
+                // Only unbind this request's own use cases.
+                cameraProvider?.unbind(preview, imageCapture)
+                outputFile.delete()
+            }
+        }
         openCameraForUseCases(preview, imageCapture) { provider ->
             val outputOptions = ImageCapture.OutputFileOptions.Builder(outputFile).build()
             imageCapture.takePicture(
@@ -79,6 +87,11 @@ class CameraManager
                 ContextCompat.getMainExecutor(context),
                 object : ImageCapture.OnImageSavedCallback {
                     override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        if (!cont.isActive) {
+                            outputFile.delete()
+                            provider.unbind(preview, imageCapture)
+                            return
+                        }
                         val uri = output.savedUri ?: Uri.fromFile(outputFile)
 
                         config.postProcessConfig?.let { ppConfig ->
@@ -93,18 +106,18 @@ class CameraManager
                                 )
                             } catch (e: Exception) {
                                 if (cont.isActive) cont.resume(CaptureResult.Failure(e))
-                                provider.unbindAll()
+                                provider.unbind(preview, imageCapture)
                                 return
                             }
                         }
 
                         if (cont.isActive) cont.resume(CaptureResult.Success(uri))
-                        provider.unbindAll()
+                        provider.unbind(preview, imageCapture)
                     }
 
                     override fun onError(exception: ImageCaptureException) {
                         if (cont.isActive) cont.resume(CaptureResult.Failure(exception))
-                        provider.unbindAll()
+                        provider.unbind(preview, imageCapture)
                     }
                 }
             )
@@ -131,9 +144,11 @@ class CameraManager
         val videoCapture = buildVideoCapture(config)
         val preview = buildPreview()
         var recording: Recording? = null
+        var recordingProvider: ProcessCameraProvider? = null
         val deferred = CompletableDeferred<CaptureResult<Uri>>()
 
         openCameraForUseCases(preview, videoCapture) { provider ->
+            recordingProvider = provider
             val outputOptions = FileOutputOptions.Builder(outputFile).build()
 
             var recordingSession = videoCapture.output
@@ -151,7 +166,7 @@ class CameraManager
                             CaptureResult.Failure(Exception("Video capture error: ${event.error}"))
                         )
                     }
-                    provider.unbindAll()
+                    provider.unbind(preview, videoCapture)
                 }
             }
             duration?.let { d ->
@@ -161,6 +176,7 @@ class CameraManager
         return CaptureSessionImpl(deferred) {
             recording?.stop()
             recording = null
+            recordingProvider?.unbind(preview, videoCapture)
         }
     }
 
@@ -207,14 +223,14 @@ class CameraManager
                         val result = multiFormatReader.decodeWithState(binaryBitmap)
                         if (!deferred.isCompleted) {
                             deferred.complete(CaptureResult.Success(result.text))
-                            mainHandler.post { providerForStop?.unbindAll() }
+                            mainHandler.post { providerForStop?.unbind(preview, imageAnalysis) }
                         }
                     } catch (e: NotFoundException) {
                         // No QR code found in this frame; ignore and keep scanning.
                     } catch (e: Exception) {
                         if (!deferred.isCompleted) {
                             deferred.complete(CaptureResult.Failure(e))
-                            mainHandler.post { providerForStop?.unbindAll() }
+                            mainHandler.post { providerForStop?.unbind(preview, imageAnalysis) }
                         }
                     } finally {
                         multiFormatReader.reset()
@@ -233,7 +249,7 @@ class CameraManager
                 mainHandler.postDelayed({
                     if (provider.isBound(imageAnalysis) && !deferred.isCompleted) {
                         deferred.complete(CaptureResult.Success(null))
-                        provider.unbindAll()
+                        provider.unbind(preview, imageAnalysis)
                     }
                 }, t)
             }
@@ -242,7 +258,7 @@ class CameraManager
             providerForStop?.let { p ->
                 if (p.isBound(imageAnalysis) && !deferred.isCompleted) {
                     deferred.complete(CaptureResult.Success(null))
-                    mainHandler.post { p.unbindAll() }
+                    mainHandler.post { p.unbind(preview, imageAnalysis) }
                 }
             }
         }
@@ -254,7 +270,7 @@ class CameraManager
         vararg useCases: UseCase,
         onBound: (ProcessCameraProvider) -> Unit
     ) {
-        val provider = cameraProvider ?: return // Reuse existing instance
+        val provider = cameraProvider ?: throw IllegalStateException("Camera is not ready")
 
         provider.unbindAll()
         provider.bindToLifecycle(

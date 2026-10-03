@@ -2,9 +2,11 @@ package org.openpin.primaryapp.backend
 
 import android.util.Log
 import com.google.gson.Gson
+import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
 import org.openpin.appframework.daemonbridge.process.ProcessHandler
 import org.openpin.appframework.daemonbridge.process.RequestProcess
+import org.openpin.appframework.daemonbridge.process.ShellProcess
 import org.openpin.appframework.devicestate.battery.BatteryManager
 import org.openpin.appframework.devicestate.location.LocationManager
 import org.openpin.appframework.devicestate.location.ResolvedLocation
@@ -40,6 +42,16 @@ data class PairDetails(
     val baseUrl: String,
     val deviceId: String
 )
+
+data class PinCommand(
+    val id: String,
+    val name: String,
+    val params: JsonObject,
+    val expiresAt: Long,
+    val timeoutMs: Long
+)
+
+data class CommandPollResponse(val command: PinCommand?)
 
 enum class WeatherConditions {
     @SerializedName("rainy")
@@ -191,7 +203,7 @@ class BackendManager(
         }
     }
 
-    suspend fun sendUploadRequest(captureFile: File) {
+    suspend fun sendUploadRequest(captureFile: File): JsonObject {
         val baseUrl = configurationManager.getString(ConfigKey.BACKEND_BASE_URL)!!
         val deviceId = configurationManager.getString(ConfigKey.DEVICE_ID)!!
 
@@ -209,14 +221,56 @@ class BackendManager(
             payloadType = RequestProcess.PayloadType.MULTIPART
         )
 
+        // A remote capture must finish or fail within the command deadline.
+        val boundedRequest = ShellProcess(req.command + " --connect-timeout 5 --max-time 20")
         try {
-            processHandler.execute(req)
+            processHandler.execute(boundedRequest)
 
-            if (req.error.isNotEmpty()) {
-                throw RuntimeException("Upload request returned error: ${req.error}")
+            if (boundedRequest.error.isNotEmpty()) {
+                throw RuntimeException("Capture upload failed")
             }
+            // Original OpenPin backends may return no JSON; local gestures only
+            // need HTTP success. Remote commands additionally require captureId.
+            return runCatching { gson.fromJson(boundedRequest.output, JsonObject::class.java) }
+                .getOrNull() ?: JsonObject()
         } finally {
-            processHandler.release(req)
+            processHandler.release(boundedRequest)
+        }
+    }
+
+    suspend fun pollCommands(status: Map<String, Any>): PinCommand? {
+        return gson.fromJson(
+            sendCommandRequest("poll", mapOf("status" to status)),
+            CommandPollResponse::class.java
+        )?.command
+    }
+
+    suspend fun acknowledgeCommand(id: String, result: Map<String, Any>) {
+        sendCommandRequest("result", mapOf("id" to id, "result" to result))
+    }
+
+    private suspend fun sendCommandRequest(endpoint: String, fields: Map<String, Any>): String {
+        val baseUrl = configurationManager.getString(ConfigKey.BACKEND_BASE_URL)
+            ?: throw IllegalStateException("Pin is not linked")
+        val deviceId = configurationManager.getString(ConfigKey.DEVICE_ID)
+            ?: throw IllegalStateException("Pin is not linked")
+        val request = RequestProcess(
+            url = "$baseUrl/api/dev/commands/$endpoint",
+            method = "POST",
+            headers = mapOf("Content-Type" to "application/json"),
+            payload = RequestProcess.Payload.FromString(gson.toJson(fields + ("deviceId" to deviceId))),
+            payloadType = RequestProcess.PayloadType.RAW
+        )
+        // The existing daemon performs network I/O; fixed flags bound each poll/ACK.
+        val boundedRequest = ShellProcess(request.command + " --connect-timeout 5 --max-time 10")
+        try {
+            processHandler.execute(boundedRequest)
+            if (boundedRequest.error.isNotEmpty()) {
+                throw IllegalStateException("Pin command request failed")
+            }
+            return boundedRequest.output
+        } finally {
+            processHandler.release(boundedRequest)
         }
     }
 

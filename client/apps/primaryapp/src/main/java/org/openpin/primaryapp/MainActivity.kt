@@ -46,19 +46,25 @@ class MainActivity : PinActivity() {
             single { ConfigurationManager(get()) }
             single { BackendManager(get(), get(), get(), get()) }
             single { GestureManager(get(), get(), get(), get(), get(), get(), get()) }
+            single { RemoteCommandsManager(get(), get(), get(), get(), get(), get(), get()) }
             viewModel { HomeViewModel(get(), get()) }
-            viewModel { LinkDeviceViewModel(get(), get(), get()) }
+            viewModel { LinkDeviceViewModel(get(), get(), get(), get()) }
             viewModel { OtherSettingsViewModel(get(), get(), get(), get()) }
         }
     )
 
     private lateinit var gestureManager: GestureManager
+    private var remoteCommands: RemoteCommandsManager? = null
 
     override fun onReady() {
         super.onReady()
 
-        gestureManager = get<GestureManager>()
-        gestureManager.addListeners()
+        if (!::gestureManager.isInitialized) {
+            gestureManager = get<GestureManager>()
+            gestureManager.addListeners()
+            remoteCommands = get<RemoteCommandsManager>()
+        }
+        if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) remoteCommands?.start()
 
         val navigationController = NavigationController().apply {
             init { HomeView(navigationController = this) }
@@ -66,5 +72,20 @@ class MainActivity : PinActivity() {
         setGraphicsContent {
             AppContainer(navigationController = navigationController)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        remoteCommands?.start()
+    }
+
+    override fun onPause() {
+        remoteCommands?.stop()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        remoteCommands?.close()
+        super.onDestroy()
     }
 }

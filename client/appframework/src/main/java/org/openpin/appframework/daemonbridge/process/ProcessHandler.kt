@@ -3,6 +3,8 @@ package org.openpin.appframework.daemonbridge.process
 import android.os.Bundle
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.openpin.appframework.daemonbridge.manager.DaemonFileSystem
 import org.openpin.appframework.daemonbridge.manager.DaemonIntentReceiver
@@ -11,23 +13,22 @@ import java.io.File
 import java.io.FileWriter
 import java.io.IOException
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
-import kotlin.coroutines.Continuation
 import kotlin.coroutines.resume
-import kotlin.coroutines.suspendCoroutine
+import kotlin.coroutines.resumeWithException
 
 class ProcessHandler : DaemonIntentReceiver, Closeable {
 
     private lateinit var fileSystem: DaemonFileSystem
     private lateinit var activeProcessesFile: File
     private val activeProcesses = mutableSetOf<String>()
+    private val processLock = Any()
 
     private data class WaitingProcess(
         val process: ShellProcess,
-        val continuation: Continuation<ShellProcess>
+        val continuation: CancellableContinuation<ShellProcess>
     )
 
-    private val waiting = ConcurrentHashMap<String, WaitingProcess>()
+    private val waiting = mutableMapOf<String, WaitingProcess>()
 
     override fun setFileSystem(fileSystem: DaemonFileSystem) {
         this.fileSystem = fileSystem
@@ -36,18 +37,23 @@ class ProcessHandler : DaemonIntentReceiver, Closeable {
 
     override fun onReceive(extras: Bundle?) {
         val pid = extras?.getString("pid") ?: return
-        val entry = waiting.remove(pid)
+        val entry = synchronized(processLock) { waiting.remove(pid) }
 
         if (entry == null) {
-            Log.w("ProcessHandler", "Got 'process done' for completed process!!")
+            // Cancelled requests may still send a completion broadcast.
             return
         }
 
         val outFile = fileSystem.get("processes/$pid-out.txt")
         val errFile = fileSystem.get("processes/$pid-err.txt")
 
-        entry.process.output = outFile.takeIf { it.exists() }?.readText().orEmpty()
-        entry.process.error = errFile.takeIf { it.exists() }?.readText().orEmpty()
+        try {
+            entry.process.output = outFile.takeIf { it.exists() }?.readText().orEmpty()
+            entry.process.error = errFile.takeIf { it.exists() }?.readText().orEmpty()
+        } catch (error: IOException) {
+            entry.continuation.resumeWithException(error)
+            return
+        }
 
         entry.continuation.resume(entry.process)
     }
@@ -73,36 +79,62 @@ class ProcessHandler : DaemonIntentReceiver, Closeable {
             throw e
         }
 
-        activeProcesses.add(pid)
-        updateActiveProcessesFile()
-
-        suspendCoroutine { cont ->
-            waiting[pid] = WaitingProcess(process, cont)
+        suspendCancellableCoroutine { cont ->
+            synchronized(processLock) {
+                // Register before publishing the PID; a fast daemon response must
+                // never arrive before the continuation exists.
+                waiting[pid] = WaitingProcess(process, cont)
+                cont.invokeOnCancellation {
+                    synchronized(processLock) {
+                        waiting.remove(pid)
+                        activeProcesses.remove(pid)
+                        updateActiveProcessesFile()
+                    }
+                }
+                if (cont.isActive) {
+                    activeProcesses.add(pid)
+                    if (!updateActiveProcessesFile()) {
+                        waiting.remove(pid)
+                        activeProcesses.remove(pid)
+                        cont.resumeWithException(IOException("Unable to publish daemon request"))
+                    }
+                }
+            }
         }
     }
 
     fun release(process: ShellProcess) {
-        activeProcesses.remove(process.pid)
-        updateActiveProcessesFile()
+        synchronized(processLock) {
+            activeProcesses.remove(process.pid)
+            updateActiveProcessesFile()
+        }
     }
 
     override fun close() {
-        waiting.clear()
-        activeProcesses.clear()
-        updateActiveProcessesFile()
+        val pending = synchronized(processLock) {
+            val pending = waiting.values.toList()
+            waiting.clear()
+            activeProcesses.clear()
+            updateActiveProcessesFile()
+            pending
+        }
+        pending.forEach { it.continuation.cancel() }
     }
 
-    private fun updateActiveProcessesFile() {
-//        Log.w("ProcessHandler", "Active Processes")
-//        for (proc in activeProcesses) {
-//            Log.w("ProcessHandler", proc)
-//        }
+    private fun updateActiveProcessesFile(): Boolean {
         try {
-            FileWriter(activeProcessesFile, false).use { writer ->
+            // Never expose a half-written set, which could release other requests.
+            val temporary = File(activeProcessesFile.parentFile, "active-processes.tmp")
+            FileWriter(temporary, false).use { writer ->
                 activeProcesses.forEach { writer.write("$it\n") }
             }
+            if (!temporary.renameTo(activeProcessesFile)) {
+                throw IOException("Unable to replace active process list")
+            }
+            return true
         } catch (e: IOException) {
             Log.e("ProcessHandler", "Failed to update active-processes.txt", e)
+            return false
         }
     }
 }

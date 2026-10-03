@@ -4,6 +4,8 @@ import org.openpin.primaryapp.gestureinterpreter.GestureInterpreter
 import org.openpin.appframework.media.soundplayer.SoundPlayer
 import android.net.Uri
 import android.util.Log
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.delay
@@ -20,6 +22,7 @@ import org.openpin.appframework.sensors.microphone.RecordSession
 import org.openpin.appframework.media.soundplayer.withLoadingSounds
 import org.openpin.appframework.sensors.camera.CaptureResult
 import org.openpin.appframework.sensors.camera.CaptureSession
+import org.openpin.appframework.sensors.camera.VideoCaptureConfig
 import org.openpin.primaryapp.backend.BackendManager
 import org.openpin.primaryapp.gestureinterpreter.InterpreterMode
 import java.io.File
@@ -57,9 +60,27 @@ class GestureManager(
         VOICE_INPUT,
         VOICE_THINKING,
         VOICE_RESPONDING,
+        PAIRING,
         SETTINGS_TOGGLE
     }
     private var state = State.IDLE
+
+    val activity: String get() = state.name.lowercase()
+
+    /** Reserve the shared camera while the link screen scans a QR code. */
+    fun beginPairing(): Boolean {
+        if (state != State.IDLE) return false
+        state = State.PAIRING
+        gestureInterpreter.setMode(InterpreterMode.DISABLED)
+        return true
+    }
+
+    fun endPairing() {
+        if (state == State.PAIRING) {
+            state = State.IDLE
+            gestureInterpreter.setMode(InterpreterMode.NORMAL)
+        }
+    }
 
     class CaptureException(s: String) : Exception(s)
 
@@ -129,6 +150,7 @@ class GestureManager(
     }
 
     private suspend fun handleCapturePhoto() {
+        if (state != State.IDLE) return
         runIfPaired {
             gestureInterpreter.setMode(InterpreterMode.DISABLED)
             state = State.PHOTO_CAPTURE
@@ -167,6 +189,7 @@ class GestureManager(
     }
 
     private suspend fun handleCaptureVideo() {
+        if (state != State.IDLE) return
         runIfPaired {
             gestureInterpreter.setMode(InterpreterMode.CANCELABLE)
             state = State.VIDEO_CAPTURE
@@ -205,6 +228,7 @@ class GestureManager(
                     soundPlayer.play(SystemSound.FAILED.key)
                 }
             } finally {
+                videoCaptureSession?.stop()
                 videoCaptureSession = null
                 videoFile.delete()
 
@@ -215,6 +239,7 @@ class GestureManager(
     }
 
     private fun handleStartVoiceInput(isTranslating: Boolean) {
+        if (state != State.IDLE) return
         runIfPaired {
             gestureInterpreter.setMode(InterpreterMode.DISABLED)
             state = State.VOICE_INPUT
@@ -317,6 +342,52 @@ class GestureManager(
             it.stop()
             it.result.delete()
             speechCapture = null
+        }
+    }
+
+    /** Runs on the main dispatcher, sharing the same state gate as local gestures. */
+    suspend fun captureRemotely(durationSeconds: Int? = null): Map<String, Any> {
+        check(backendManager.isPaired) { "Pin is not linked" }
+        check(state == State.IDLE) { "Pin is busy; finish the current interaction first" }
+        require(durationSeconds == null || durationSeconds in 1..15)
+        val file = processHandler.createTempFile(if (durationSeconds == null) "jpg" else "mp4")
+        state = if (durationSeconds == null) State.PHOTO_CAPTURE else State.VIDEO_CAPTURE
+        gestureInterpreter.setMode(
+            if (durationSeconds == null) InterpreterMode.DISABLED else InterpreterMode.CANCELABLE
+        )
+        try {
+            val result = if (durationSeconds == null) {
+                // Audible notice precedes any remotely initiated camera capture.
+                soundPlayer.play(SystemSound.VISION.key)
+                delay(300)
+                cameraManager.captureImage(file, ImageCaptureConfig(
+                    jpegQuality = 85,
+                    postProcessConfig = PostProcessConfig(newWidth = 1920, newHeight = 1440)
+                ))
+            } else {
+                soundPlayer.play(SystemSound.VIDEO_START.key)
+                delay(300)
+                videoCaptureSession = cameraManager.captureVideo(
+                    file, durationSeconds * 1000L,
+                    VideoCaptureConfig(qualitySelector = QualitySelector.from(Quality.SD))
+                )
+                videoCaptureSession!!.waitForResult()
+            }
+            check(result is CaptureResult.Success) { "Camera capture failed" }
+            soundPlayer.play(
+                if (durationSeconds == null) SystemSound.SHUTTER.key else SystemSound.VIDEO_END.key
+            )
+            check(file.length() in 1..8L * 1024 * 1024) { "Capture exceeded the 8 MiB upload limit" }
+            val uploaded = backendManager.sendUploadRequest(file)
+            val captureId = uploaded.get("captureId")?.asString
+                ?: throw IllegalStateException("Capture upload was not acknowledged")
+            return mapOf("ok" to true, "captureId" to captureId)
+        } finally {
+            videoCaptureSession?.stop()
+            videoCaptureSession = null
+            file.delete()
+            gestureInterpreter.setMode(InterpreterMode.NORMAL)
+            state = State.IDLE
         }
     }
 

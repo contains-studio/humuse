@@ -241,3 +241,53 @@ async def test_bridge_failure_statuses(tmp_path, failure, status):
     async with client:
         response = await client.post("/api/dev/handle", data=voice_packet(device_id))
         assert response.status == status
+
+
+async def test_environment_and_remote_commands_are_authenticated(tmp_path):
+    from openpin_muse.controls import PinControls
+    class Environment:
+        async def home_data(self):
+            return {"location": "Fixture city", "temp": "20 C", "conditions": "sunny"}
+        async def locate(self, entries):
+            assert entries == [{"fixture": True}]
+            return {"location": {"lat": 10, "lng": 20}, "accuracy": 50}
+    controls = PinControls()
+    app = create_app(StubBridge(), tmp_path, public_url="https://pin.example",
+                     environment=Environment(), controls=controls)
+    async with TestClient(TestServer(app)) as client:
+        link = issue_pairing(tmp_path, "https://pin.example")
+        device = (await (await client.post(urlsplit(link).path)).json())["deviceId"]
+        home = await (await client.post("/api/dev/home-data", json={"deviceId": device})).json()
+        assert home["location"] == "Fixture city" and home["conditions"] == "sunny"
+        located = await client.post("/api/dev/locate", json={"deviceId": device, "wifiAccessPoints": [{"fixture": True}]})
+        assert (await located.json())["location"] == {"lat": 10, "lng": 20}
+        pending = asyncio.create_task(controls.submit("ring", {}))
+        await asyncio.sleep(0)
+        assert (await client.post("/api/dev/commands/poll", json={"deviceId": "wrong"})).status == 401
+        command = (await (await client.post("/api/dev/commands/poll", json={"deviceId": device})).json())["command"]
+        assert command["name"] == "ring"
+        response = await client.post("/api/dev/commands/result", json={"deviceId": device,
+                                      "id": command["id"], "result": {"ok": True}})
+        assert response.status == 200
+        assert (await pending)["ok"] is True
+
+
+async def test_gallery_saves_captures_while_muse_is_offline(tmp_path):
+    from openpin_muse.gallery import Gallery
+    gallery = Gallery(tmp_path)
+    bridge = StubBridge()
+    bridge.ready = False
+    app = create_app(bridge, tmp_path, public_url="https://pin.example", gallery=gallery)
+    async with TestClient(TestServer(app)) as client:
+        link = issue_pairing(tmp_path, "https://pin.example")
+        device = (await (await client.post(urlsplit(link).path)).json())["deviceId"]
+        response = await client.post("/api/dev/upload-capture", data=capture_form(
+            device, b"\xff\xd8\xfffixture", "camera.jpg"))
+        assert response.status == 200
+        capture_id = (await response.json())["captureId"]
+        entry, path = await gallery.get(capture_id)
+        assert path.read_bytes() == b"\xff\xd8\xfffixture"
+        async with asyncio.timeout(2):
+            while (await gallery.get(capture_id))[0]["muse_status"] == "pending":
+                await asyncio.sleep(0.01)
+        assert (await gallery.get(capture_id))[0]["muse_status"] == "failed"

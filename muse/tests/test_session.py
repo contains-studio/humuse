@@ -104,6 +104,7 @@ async def connected(*, register=True, session_class=MuseSession, **kwargs):
         assert url == "wss://vm.example/v1/noise?vm_id=vm-test"
         assert headers == {"Authorization": "Bearer local-test-token"}
         return device_ws
+    kwargs.setdefault("settle_seconds", 0.02)
     session = session_class(
         noise_host="vm.example", vm_id="vm-test", vm_auth_token="local-test-token",
         device=DeviceDescription(node_id="openpin-test", display_name="OpenPin", version="0.1", commands={}),
@@ -344,7 +345,10 @@ async def test_next_turn_reuses_subscription_but_rejects_previous_turn_replies()
 
 
 @pytest.mark.asyncio
-async def test_only_first_completed_answer_is_downloaded():
+async def test_all_completed_answers_are_downloaded_once_in_message_order(monkeypatch):
+    async def combine(parts):
+        return b"|".join(parts)
+    monkeypatch.setattr("openpin_muse.session.combine_mp3", combine, raising=False)
     async with connected() as (session, vm, _):
         answer = asyncio.create_task(session.converse(wav()))
         chat = await vm.subscribe_and_chat()
@@ -354,7 +358,11 @@ async def test_only_first_completed_answer_is_downloaded():
         tts = await vm.frame()
         assert tts.value.path.endswith("message_id=first-answer")
         await vm.response(tts.stream_id, b"ID3first")
-        assert await answer == b"ID3first"
+        second = await vm.frame()
+        assert second.value.path.endswith("message_id=second-answer")
+        await vm.event("message.assistant", "second-answer", parent="our-user", content="Duplicate")
+        await vm.response(second.stream_id, b"ID3second")
+        assert await answer == b"ID3first|ID3second"
         assert vm.ws.inbox.empty()
 
 

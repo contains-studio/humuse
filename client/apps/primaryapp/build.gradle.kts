@@ -70,6 +70,8 @@ dependencies {
     implementation(libs.koin.androidx.compose)
 
     implementation(libs.gson)
+    implementation(libs.androidx.camera.video)
+    testImplementation("junit:junit:4.13.2")
 }
 
 fun Project.loadSecrets(vararg keys: String): Map<String, String> {

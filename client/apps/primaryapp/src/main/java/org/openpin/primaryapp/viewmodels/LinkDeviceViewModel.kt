@@ -13,11 +13,13 @@ import org.openpin.appframework.sensors.camera.CaptureResult
 import org.openpin.appframework.sensors.camera.CaptureSession
 import org.openpin.appframework.ui.controllers.NavigationController
 import org.openpin.primaryapp.backend.BackendManager
+import org.openpin.primaryapp.GestureManager
 
 class LinkDeviceViewModel(
     private val soundPlayer: SoundPlayer,
     private val cameraManager: CameraManager,
-    private val backendManager: BackendManager
+    private val backendManager: BackendManager,
+    private val gestureManager: GestureManager
 ) : ViewModel(), KoinComponent {
 
     private var scanSoundSid: Int? = null
@@ -25,6 +27,11 @@ class LinkDeviceViewModel(
     @Volatile private var isCancelled: Boolean = false
 
     fun startScanning(navigationController: NavigationController) {
+        if (!gestureManager.beginPairing()) {
+            soundPlayer.play(SystemSound.FAILED.key)
+            navigationController.pop()
+            return
+        }
         viewModelScope.launch {
             scanSoundSid = soundPlayer.play(SystemSound.QR_SCAN.key)
             isCancelled = false
@@ -64,6 +71,7 @@ class LinkDeviceViewModel(
         isCancelled = true
         scanSoundSid?.let { soundPlayer.stop(it) }
         session?.stop()
+        gestureManager.endPairing()
     }
 
     override fun onCleared() {

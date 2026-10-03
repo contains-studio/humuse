@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -37,10 +38,11 @@ from .protocol import (
 )
 
 
-MAX_CAPTURE_BYTES = 8 * 1024 * 1024
+MAX_CAPTURE_BYTES = 128 * 1024 * 1024
 MAX_JSON_BYTES = 16 * 1024
 MAX_STATE_BYTES = 16 * 1024
 STATE_FILENAME = "pairing.json"
+log = logging.getLogger(__name__)
 
 
 class Bridge(Protocol):
@@ -209,7 +211,7 @@ async def _read_part(part: BodyPartReader, maximum: int) -> bytes:
 
 
 def create_app(bridge: Bridge, state_dir: Path, *, public_url: str,
-               time_zone: str = "UTC") -> web.Application:
+               time_zone: str = "UTC", environment=None, gallery=None, controls=None) -> web.Application:
     public_url = validate_public_url(public_url)
     zone = ZoneInfo(time_zone)
     store = _StateStore(state_dir)
@@ -231,6 +233,72 @@ def create_app(bridge: Bridge, state_dir: Path, *, public_url: str,
 
     app = web.Application(middlewares=[errors], client_max_size=MAX_CAPTURE_BYTES + MAX_JSON_BYTES)
 
+    forwarding = asyncio.Queue()
+    queued: set[str] = set()
+    forwarding_lock = asyncio.Lock()
+
+    async def forward_capture(capture_id):
+        if gallery is None or await gallery.get(capture_id) is None:
+            raise ValueError("Capture does not exist")
+        async with forwarding_lock:
+            if capture_id not in queued:
+                await gallery.mark_forwarded(capture_id, "pending")
+                queued.add(capture_id)
+                forwarding.put_nowait(capture_id)
+        return {"queued": True}
+
+    async def forward_worker():
+        from .media import prepare_capture
+        while True:
+            capture_id = await forwarding.get()
+            try:
+                found = await gallery.get(capture_id)
+                if found is None:
+                    continue
+                metadata, path = found
+                if not bridge.ready:
+                    raise ConnectionError("Muse is offline")
+                data = await asyncio.to_thread(path.read_bytes)
+                data = await prepare_capture(data, metadata["mime_type"])
+                await bridge.capture(data, metadata["mime_type"])
+                await gallery.mark_forwarded(capture_id, "sent")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Retain the original locally and let the dashboard retry. Never
+                # log uploaded content or credential-bearing provider exceptions.
+                try:
+                    await gallery.mark_forwarded(capture_id, "failed")
+                except Exception:
+                    # A storage failure must not stop unrelated captures. The
+                    # retained pending item can be retried or replayed at startup.
+                    log.warning("Could not persist Muse forwarding status; original capture retained")
+            finally:
+                queued.discard(capture_id)
+                forwarding.task_done()
+
+    async def feature_lifetime(app):
+        if controls is not None:
+            controls.bind_loop()
+        worker = asyncio.create_task(forward_worker()) if gallery is not None else None
+        if gallery is not None:
+            for entry in await gallery.list():
+                if entry["muse_status"] == "pending":
+                    await forward_capture(entry["id"])
+        try:
+            yield
+        finally:
+            if worker is not None:
+                worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
+            if controls is not None:
+                await controls.close()
+            if environment is not None and hasattr(environment, "close"):
+                await environment.close()
+
+    app.cleanup_ctx.append(feature_lifetime)
+
     async def authorized(device_id):
         # CLI pairing shares this file lock. Never block the Noise event loop on it.
         return await asyncio.to_thread(store.authenticate, device_id)
@@ -251,6 +319,8 @@ def create_app(bridge: Bridge, state_dir: Path, *, public_url: str,
         device_id = await asyncio.to_thread(store.consume, request.match_info["code"], public_url)
         if device_id is None:
             return _error(404, "Pairing code is invalid or expired")
+        if controls is not None:
+            await controls.reset()
         return web.json_response({"baseUrl": public_url, "deviceId": device_id},
                                  headers={"Cache-Control": "no-store"})
 
@@ -270,6 +340,8 @@ def create_app(bridge: Bridge, state_dir: Path, *, public_url: str,
         if await request.content.read(1):
             raise ProtocolError("Unexpected data after media")
         parsed = parse_voice_request(header + body)
+        if environment is not None and parsed.metadata.latitude is not None:
+            await environment.update_coordinates(parsed.metadata.latitude, parsed.metadata.longitude)
         try:
             mp3 = await bridge.voice(parsed.audio, parsed.image,
                                      translate=request.path.endswith("/translate"))
@@ -295,13 +367,40 @@ def create_app(bridge: Bridge, state_dir: Path, *, public_url: str,
         # Android deliberately formats this epoch as UTC. Shift the selected
         # zone's wall clock into UTC, matching OpenPin's existing home contract.
         wall_clock = datetime.fromtimestamp(time.time(), zone).replace(tzinfo=timezone.utc)
-        return web.json_response({"time": int(wall_clock.timestamp() * 1000)})
+        data = await environment.home_data() if environment is not None else {}
+        return web.json_response({**data, "time": int(wall_clock.timestamp() * 1000)},
+                                 headers={"Cache-Control": "no-store"})
 
     async def locate(request):
         payload = await json_payload(request)
         if not await authorized(payload.get("deviceId")):
             return _error(401, "Unauthorized device")
-        return _error(503, "Wi-Fi geolocation is not supported by this companion")
+        if environment is None:
+            return _error(503, "Location provider is not configured")
+        try:
+            located = await environment.locate(payload.get("wifiAccessPoints"))
+        except ConnectionError:
+            return _error(503, "Location lookup is unavailable; configure a geolocation API key")
+        return web.json_response(located, headers={"Cache-Control": "no-store"})
+
+    async def poll_commands(request):
+        payload = await json_payload(request)
+        if not await authorized(payload.get("deviceId")):
+            return _error(401, "Unauthorized device")
+        command = await controls.poll(payload.get("status")) if controls is not None else None
+        return web.json_response({"command": command}, headers={"Cache-Control": "no-store"})
+
+    async def complete_command(request):
+        payload = await json_payload(request)
+        if not await authorized(payload.get("deviceId")):
+            return _error(401, "Unauthorized device")
+        if controls is None:
+            return _error(503, "Remote controls unavailable")
+        try:
+            await controls.complete(payload.get("id"), payload.get("result"))
+        except KeyError:
+            return _error(404, "Command is unknown or expired")
+        return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
 
     async def capture(request):
         if request.content_length is not None and request.content_length > MAX_CAPTURE_BYTES + MAX_JSON_BYTES:
@@ -324,6 +423,8 @@ def create_app(bridge: Bridge, state_dir: Path, *, public_url: str,
                 if not await authorized(device_id):
                     return _error(401, "Unauthorized device")
             else:
+                if device_id is None:
+                    return _error(401, "Send deviceId before the capture file")
                 suffix = Path(part.filename or "").suffix.lower()
                 mime_type = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".mp4": "video/mp4"}.get(suffix)
                 if mime_type is None:
@@ -337,6 +438,15 @@ def create_app(bridge: Bridge, state_dir: Path, *, public_url: str,
         if data is None or mime_type is None:
             raise ProtocolError("Missing capture file")
         validate_capture(data, mime_type)
+        if gallery is not None:
+            from .gallery import GalleryFull
+            try:
+                saved = await gallery.save(data, mime_type)
+            except GalleryFull:
+                return _error(507, "Gallery is full; download or delete captures before uploading more")
+            await forward_capture(saved["id"])
+            return web.json_response({"captureId": saved["id"], "museStatus": "pending"},
+                                     headers={"Cache-Control": "no-store"})
         if not bridge.ready:
             return _error(503, "Muse is not ready")
         try:
@@ -358,4 +468,10 @@ def create_app(bridge: Bridge, state_dir: Path, *, public_url: str,
     app.router.add_post("/api/dev/home-data", home)
     app.router.add_post("/api/dev/locate", locate)
     app.router.add_post("/api/dev/upload-capture", capture)
+    app.router.add_post("/api/dev/commands/poll", poll_commands)
+    app.router.add_post("/api/dev/commands/result", complete_command)
+    if gallery is not None:
+        from .dashboard import install_dashboard
+        install_dashboard(app, gallery, state_dir, public_url=public_url, controls=controls,
+                          environment=environment, forward_capture=forward_capture)
     return app

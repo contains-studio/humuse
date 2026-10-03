@@ -5,9 +5,8 @@ small adapter supplies the voice protocol documented by the SDK's ESP32 client.
 It intentionally uses LinkSession's private request registry, so the SDK revision
 must remain pinned and these protocol tests must pass before it is upgraded.
 
-One conversation returns the first completed, nonempty assistant message whose
-parent is explicitly correlated with this request's acknowledgement. Additional
-assistant messages in the same turn are not played by this initial adapter.
+Conversations collect completed messages correlated with the request acknowledgment.
+A quiet period, matching the upstream voice client, closes a multi-message reply.
 """
 
 from __future__ import annotations
@@ -24,6 +23,8 @@ from urllib.parse import quote
 
 from musegadget.link_client import APP_ID, LinkSession, encode_message
 from musegadget.noise import Header
+
+from .media import combine_mp3
 
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 MAX_JSON_BYTES = 1024 * 1024
@@ -108,10 +109,16 @@ class _Turn:
         self.pending: list[dict] = []
         self.pending_bytes = 0
         self.messages: dict[str, bool] = {}
+        self.completed: set[str] = set()
+        self.changed = asyncio.Event()
+        self.last_event = asyncio.get_running_loop().time()
+        self.last_content = self.last_event
+        self.busy = False
 
     def fail(self, error: Exception):
         if not self.done.done():
             self.done.set_exception(error)
+            self.changed.set()
 
     def acknowledge(self, body: bytes):
         try:
@@ -134,6 +141,14 @@ class _Turn:
         if self.done.done() or event.get("type") != "event":
             return
         kind = event.get("event")
+        if kind in {"agent.status", "task.status"}:
+            payload = event.get("payload", {})
+            if isinstance(payload, dict):
+                state = payload.get("code") if kind == "agent.status" else payload.get("status")
+                if isinstance(state, str):
+                    self.busy = bool(state) and state not in {"online", "idle", "completed", "failed"}
+                    self.changed.set()
+            return
         if kind not in {"delta.message_start", "delta.text_append", "delta.message_done", "message.assistant"}:
             return
         payload = event.get("payload")
@@ -165,8 +180,37 @@ class _Turn:
         if isinstance(text, str) and text.strip():
             self.messages[message_id] = True
         completed = kind == "delta.message_done" or (kind == "message.assistant" and payload.get("display_text_ready") is not False)
-        if completed and self.messages[message_id]:
-            self.done.set_result(message_id)
+        if completed:
+            self.completed.add(message_id)
+        self.last_event = self.last_content = asyncio.get_running_loop().time()
+        self.changed.set()
+
+    async def next_message(self, consumed: set[str], settle_seconds: float):
+        while True:
+            self.changed.clear()
+            if self.done.done():
+                await self.done
+            pending = [message for message in self.messages if message not in consumed]
+            if pending:
+                first = pending[0]
+                if first in self.completed:
+                    consumed.add(first)
+                    if self.messages[first]:
+                        return first
+                    continue
+            now = asyncio.get_running_loop().time()
+            quiet = settle_seconds - (now - self.last_event)
+            busy = 20 - (now - self.last_content) if self.busy else 0
+            if consumed and not pending:
+                remaining = max(quiet, busy)
+                if remaining <= 0:
+                    return None
+                try:
+                    await asyncio.wait_for(self.changed.wait(), remaining)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await self.changed.wait()
 
 
 class _Subscription:
@@ -219,17 +263,18 @@ class _Subscription:
 class MuseSession(LinkSession):
     """Registered gadget session with one-at-a-time voice and capture requests.
 
-    ``converse`` returns MP3 bytes for the first complete correlated reply. Both
+    ``converse`` returns one MP3 containing all completed correlated replies. Both
     the registration wait and complete turn are bounded by ``turn_timeout``.
     Reconnect by constructing a new MuseSession, as with the upstream SDK.
     """
 
     def __init__(self, *, turn_timeout=90.0, request_timeout=20.0,
-                 max_audio_bytes=16 * 1024 * 1024, **kwargs):
+                 max_audio_bytes=16 * 1024 * 1024, settle_seconds=3.0, **kwargs):
         super().__init__(**kwargs)
         self.turn_timeout = turn_timeout
         self.request_timeout = request_timeout
         self.max_audio_bytes = max_audio_bytes
+        self.settle_seconds = settle_seconds
         self.last_registered_at: float | None = None
         self._registration_ready = asyncio.Event()
         self._session_error: Exception | None = None
@@ -403,23 +448,30 @@ class MuseSession(LinkSession):
                     if not 200 <= status < 300:
                         raise MuseHTTPError("/chat/stream", status)
                     turn.acknowledge(ack)
-                    message_id = await turn.done
-                    query = "?message_id=" + quote(message_id, safe="")
-                    for path in ("/api/voice/tts-stream", "/voice/tts-stream"):
-                        status, audio, headers = await self._request(
-                            "GET", path + query, limit=self.max_audio_bytes, accept="audio/mpeg",
-                            guard=subscription.done,
-                        )
-                        if status != 404:
-                            break
-                    if not 200 <= status < 300:
-                        raise MuseHTTPError(path, status)
-                    content_type = headers.get("content-type", "").split(";")[0].lower().strip()
-                    if content_type and content_type not in {"audio/mpeg", "audio/mp3", "application/octet-stream"}:
-                        raise ValueError("Muse TTS response is not MP3 audio")
-                    if not audio:
-                        raise ValueError("Muse TTS returned empty audio")
-                    return audio
+                    parts = []
+                    consumed = set()
+                    size = 0
+                    while (message_id := await turn.next_message(consumed, self.settle_seconds)) is not None:
+                        query = "?message_id=" + quote(message_id, safe="")
+                        for path in ("/api/voice/tts-stream", "/voice/tts-stream"):
+                            status, audio, headers = await self._request(
+                                "GET", path + query, limit=self.max_audio_bytes - size, accept="audio/mpeg",
+                                guard=subscription.done,
+                            )
+                            if status != 404:
+                                break
+                        if not 200 <= status < 300:
+                            raise MuseHTTPError(path, status)
+                        content_type = headers.get("content-type", "").split(";")[0].lower().strip()
+                        if content_type and content_type not in {"audio/mpeg", "audio/mp3", "application/octet-stream"}:
+                            raise ValueError("Muse TTS response is not MP3 audio")
+                        if not audio:
+                            raise ValueError("Muse TTS returned empty audio")
+                        size += len(audio)
+                        parts.append(audio)
+                    if not parts:
+                        raise ValueError("Muse returned no spoken messages")
+                    return parts[0] if len(parts) == 1 else await combine_mp3(parts)
                 finally:
                     self._turn = None
                     if not turn.done.done():

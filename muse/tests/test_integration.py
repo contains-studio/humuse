@@ -21,6 +21,7 @@ import websockets.asyncio.client
 
 from openpin_muse.api import create_app, issue_pairing
 from openpin_muse.bridge import MuseBridge
+from openpin_muse.controls import PinControls
 from test_session import FakeVM, Pipe, connected
 
 
@@ -111,7 +112,13 @@ async def test_production_bridge_refreshes_registers_and_reconnects(tmp_path, mo
     monkeypatch.setattr(muse_api, "refresh_device_token", refresh)
     monkeypatch.setattr(muse_api, "fetch_vms_with_status", fetch)
     monkeypatch.setattr(websockets.asyncio.client, "connect", connect)
-    bridge = MuseBridge(Identity("02:00:00:00:00:01"), None)
+    controls = PinControls()
+
+    class Environment:
+        async def context(self):
+            return {"location": {"name": "Simulated location", "source": "configured"}}
+
+    bridge = MuseBridge(Identity("02:00:00:00:00:01"), None, controls=controls, environment=Environment())
     running = asyncio.create_task(bridge.run())
 
     async def register_peer():
@@ -119,11 +126,12 @@ async def test_production_bridge_refreshes_registers_and_reconnects(tmp_path, mo
         await vm.handshake()
         control = await vm.frame()
         assert control.value.path == "/link-control"
+        vm.control = control.stream_id
         await vm.response(control.stream_id, end=False)
         frame = await vm.frame()
         registration = vm.messages.feed(frame.value.data)[0]
         assert registration["params"]["node_id"] == "homelink-000001"
-        assert registration["params"]["commands_v2"] == {}
+        assert set(registration["params"]["commands_v2"]) == {"get_status", "ring", "set_volume", "capture_photo", "record_video", "get_environment"}
         await vm.chunk(control.stream_id, encode_message({"id": registration["id"], "ok": True}))
         async with asyncio.timeout(1):
             while not bridge.ready:
@@ -139,6 +147,32 @@ async def test_production_bridge_refreshes_registers_and_reconnects(tmp_path, mo
             while bridge.ready:
                 await asyncio.sleep(0.005)
         second = await register_peer()
+        await second.chunk(second.control, encode_message({"method": "link.invoke", "id": "remote-command",
+                           "command": "set_volume", "params": {"volume": 0.4}}))
+        async with asyncio.timeout(2):
+            command = None
+            while command is None:
+                command = await controls.poll({"battery": 0.75})
+                await asyncio.sleep(0.005)
+        assert command["name"] == "set_volume" and command["params"] == {"volume": 0.4}
+        await controls.complete(command["id"], {"ok": True, "volume": 0.4})
+        result = await second.frame()
+        returned = second.messages.feed(result.value.data)[0]
+        assert returned == {"method": "link.result", "id": "remote-command", "ok": True, "payload": {"volume": 0.4}}
+        await second.chunk(second.control, encode_message({"method": "link.invoke", "id": "environment-command",
+                           "command": "get_environment", "params": {}}))
+        result = await second.frame()
+        assert second.messages.feed(result.value.data)[0] == {
+            "method": "link.result", "id": "environment-command", "ok": True,
+            "payload": {"location": {"name": "Simulated location", "source": "configured"}},
+        }
+        await second.chunk(second.control, encode_message({"method": "link.invoke", "id": "bad-command",
+                           "command": "system.run", "params": {}}))
+        result = await second.frame()
+        assert second.messages.feed(result.value.data)[0] == {
+            "method": "link.result", "id": "bad-command", "ok": False,
+            "error": "Unsupported Pin command",
+        }
         sending = asyncio.create_task(bridge.capture(b"jpeg-fixture", "image/jpeg"))
         request = await second.frame()
         assert request.value.path == "/chat/stream"
